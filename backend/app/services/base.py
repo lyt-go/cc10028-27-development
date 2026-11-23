@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import hashlib
+import threading
 import time
 import importlib
 from pathlib import Path
@@ -32,6 +33,11 @@ class BaseModuleService:
     STATUS_ORDER: list[str] = []
     ACTION_RULES: dict[str, str] = {}
     NEGATIVE_ACTIONS: list[str] = []
+
+    # 产物写入锁：交付导出、版本发布等写路径共用的一把可重入锁。
+    # 提交发布与旧包下载并发时，写操作串行化，读路径（回执重开、历史包读取）
+    # 不持锁，历史数据始终可照常读取。
+    _ARTIFACT_LOCK = threading.RLock()
 
     # -- 基础 CRUD --
 

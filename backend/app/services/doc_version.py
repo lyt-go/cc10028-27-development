@@ -141,18 +141,87 @@ class DocVersionService(BaseModuleService):
         }
 
     def publish_snapshot(self, snapshot_id: str) -> dict[str, Any]:
-        """发布指定版本快照到目标系统，将快照状态更新为'已发布'。"""
-        version_files = sorted(self._data_dir("versions").glob("*.jsonl"))
-        for vf in version_files:
-            data = self._read_jsonl(vf)
-            for snap in data:
-                if snap.get("快照编号") == snapshot_id:
-                    snap["status"] = "已发布"
-                    output_path = self._data_dir("versions") / f"{snapshot_id}_published.jsonl"
-                    self._write_jsonl(output_path, [snap])
-                    return {
-                        "snapshot_id": snapshot_id,
-                        "status": "已发布",
-                        "output": str(output_path),
-                    }
-        return {"error": f"版本快照 {snapshot_id} 不存在"}
+        """发布指定版本快照到目标系统，将快照状态更新为'已发布'。
+
+        发布时读取交付回执确认本批数据状态：已完成的空文档凭零结果交付
+        凭据确认本批零条，不伪造实体或分片记录；抽取未全部完成的快照
+        返回待完成环节，不把暂时的空结果当作零条发布。重复发布只重开
+        既有回执，历史数据保持不变。
+        """
+        with self._ARTIFACT_LOCK:
+            output_path = self._data_dir("versions") / f"{snapshot_id}_published.jsonl"
+
+            # 幂等重开：已发布的快照直接重开既有发布回执，不重复写发布记录
+            existing = self._read_jsonl(output_path)
+            if existing:
+                result = {
+                    "snapshot_id": snapshot_id,
+                    "status": existing[0].get("status", "已发布"),
+                    "output": str(output_path),
+                    "reopened": True,
+                }
+                result.update(self._delivery_confirmation(snapshot_id))
+                return result
+
+            version_files = sorted(self._data_dir("versions").glob("*.jsonl"))
+            snap_found = None
+            for vf in version_files:
+                for snap in self._read_jsonl(vf):
+                    if snap.get("快照编号") == snapshot_id:
+                        snap_found = snap
+                        break
+                if snap_found:
+                    break
+            if snap_found is None:
+                return {"error": f"版本快照 {snapshot_id} 不存在"}
+
+            snap_found["status"] = "已发布"
+            self._write_jsonl(output_path, [snap_found])
+            result = {
+                "snapshot_id": snapshot_id,
+                "status": "已发布",
+                "output": str(output_path),
+                "reopened": False,
+            }
+            result.update(self._delivery_confirmation(snapshot_id))
+            return result
+
+    def _delivery_confirmation(self, snapshot_id: str) -> dict[str, Any]:
+        """读取交付回执（必要时先触发一次幂等交付），确认本批数据回执与零结果凭据。"""
+        deliver = self._trigger_result_deliver(snapshot_id)
+        if "error" in deliver:
+            return {"交付回执": None, "message": deliver["error"]}
+        if deliver.get("confirmable") is False:
+            return {
+                "交付回执": None,
+                "待完成环节": deliver.get("pending_stages", []),
+                "message": deliver.get("message", "抽取未全部完成，暂不能确认为零结果"),
+            }
+
+        cls = self._safe_import("app.services.result_deliver", "ResultDeliverService")
+        receipt_info = cls().get_delivery_receipt(snapshot_id)
+        if "error" in receipt_info:
+            return {"交付回执": None, "message": receipt_info["error"]}
+
+        receipt = receipt_info.get("回执", {})
+        confirmation: dict[str, Any] = {
+            "交付回执": {
+                "交付编号": receipt.get("交付编号"),
+                "记录条数": receipt_info.get("记录条数", 0),
+                "分片数量": receipt_info.get("分片数量", 0),
+                "零结果": receipt_info.get("零结果", False),
+                "交付时间": receipt.get("交付时间"),
+            },
+        }
+        if receipt_info.get("零结果"):
+            verify = receipt_info.get("凭据核验", {})
+            confirmation["零结果凭据"] = {
+                "凭据编号": verify.get("凭据编号"),
+                "凭据摘要": verify.get("凭据摘要"),
+                "凭据有效": verify.get("凭据有效"),
+                "证据仍成立": verify.get("证据仍成立"),
+            }
+            confirmation["message"] = "本批零条已经零结果交付凭据确认，发布完成"
+        else:
+            confirmation["message"] = f"本批交付 {confirmation['交付回执']['记录条数']} 条，发布完成"
+        return confirmation
